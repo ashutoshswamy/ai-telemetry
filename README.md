@@ -1,4 +1,4 @@
-# AI Usage Aggregator
+# AI Telemetry
 
 A local, privacy-first telemetry dashboard for your AI coding assistants. Parses CLI histories, session logs, and IDE databases to visualize real-time usage metrics across models and tools — all without sending a single byte off your machine.
 
