@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+frontend/README.md
+frontend/dist/
+frontend/node_modules/
