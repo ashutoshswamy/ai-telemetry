@@ -1,6 +1,9 @@
 from flask import Flask, jsonify
 from flask_cors import CORS
-from track_antigravity import get_all_metrics, get_user_info
+from track_antigravity import (
+    get_all_metrics, get_user_info,
+    collect_claude_code_details, collect_codex_details, collect_antigravity_details,
+)
 
 app = Flask(__name__)
 CORS(app, origins=["http://localhost:5173"])
@@ -22,6 +25,30 @@ def get_user():
     try:
         user_info = get_user_info()
         return jsonify({"status": "success", "data": user_info})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route("/api/claude_details")
+def get_claude_details():
+    try:
+        data = collect_claude_code_details()
+        return jsonify({"status": "success", "data": data})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route("/api/codex_details")
+def get_codex_details():
+    try:
+        data = collect_codex_details()
+        return jsonify({"status": "success", "data": data})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route("/api/antigravity_details")
+def get_antigravity_details():
+    try:
+        data = collect_antigravity_details()
+        return jsonify({"status": "success", "data": data})
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 

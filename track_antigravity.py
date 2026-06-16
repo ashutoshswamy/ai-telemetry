@@ -322,6 +322,484 @@ def collect_claude_code_metrics():
     return model_analytics
 
 
+PRICING_RULES = [
+    (r'claude-opus-4|opus-4',          dict(input=15,   output=75,   cache_read=1.50,  cache_write=18.75)),
+    (r'claude-sonnet-4|sonnet-4',      dict(input=3,    output=15,   cache_read=0.30,  cache_write=3.75)),
+    (r'claude-haiku-4|haiku-4',        dict(input=0.80, output=4,    cache_read=0.08,  cache_write=1.00)),
+    (r'claude-3-7-sonnet|3\.7-sonnet', dict(input=3,    output=15,   cache_read=0.30,  cache_write=3.75)),
+    (r'claude-3-5-sonnet|3\.5-sonnet', dict(input=3,    output=15,   cache_read=0.30,  cache_write=3.75)),
+    (r'claude-3-5-haiku|3\.5-haiku',   dict(input=0.80, output=4,    cache_read=0.08,  cache_write=1.00)),
+    (r'claude-3-opus',                  dict(input=15,   output=75,   cache_read=1.50,  cache_write=18.75)),
+    (r'claude-3-sonnet',                dict(input=3,    output=15,   cache_read=0.30,  cache_write=3.75)),
+    (r'claude-3-haiku',                 dict(input=0.25, output=1.25, cache_read=0.03,  cache_write=0.30)),
+    (r'gpt-4o-mini',                    dict(input=0.15, output=0.60, cache_read=0.075, cache_write=0)),
+    (r'gpt-4o',                         dict(input=2.50, output=10,   cache_read=1.25,  cache_write=0)),
+    (r'o4-mini|o3-mini',                dict(input=1.10, output=4.40, cache_read=0.275, cache_write=0)),
+    (r'o3\b',                           dict(input=10,   output=40,   cache_read=2.50,  cache_write=0)),
+]
+
+
+def calc_cost(model_id, input_tok, output_tok, cache_read, cache_write):
+    for pattern, rates in PRICING_RULES:
+        if re.search(pattern, model_id, re.IGNORECASE):
+            MTok = 1_000_000
+            return (input_tok * rates['input'] + output_tok * rates['output'] +
+                    cache_read * rates['cache_read'] + cache_write * rates['cache_write']) / MTok
+    return 0.0
+
+
+def _decode_project_name(dir_name):
+    """Decode a ~/.claude/projects dir name to a short human-readable project label."""
+    # Strip leading dash
+    s = dir_name.lstrip("-")
+    # Strip leading 'Users-<username>-'
+    parts = s.split("-")
+    if len(parts) >= 2 and parts[0] == "Users":
+        s = "-".join(parts[2:])  # drop 'Users' and username
+    # Strip common mount prefixes
+    for prefix in ("Documents-", "Desktop-", "Downloads-"):
+        if s.startswith(prefix):
+            s = s[len(prefix):]
+            break
+    # Take last 2 hyphen-separated tokens as "Parent/child"
+    tokens = s.split("-")
+    if len(tokens) >= 2:
+        return tokens[-2] + "/" + tokens[-1]
+    return s
+
+
+def collect_claude_code_details():
+    from datetime import datetime, timezone, timedelta
+
+    projects_dir = Path.home() / ".claude" / "projects"
+    if not projects_dir.exists():
+        return {"sessions": [], "projects": {}, "daily": [], "hourly": []}
+
+    now_utc = datetime.now(timezone.utc)
+    cutoff_60d = now_utc - timedelta(days=60)
+    cutoff_30d = now_utc - timedelta(days=30)
+
+    # Accumulators
+    sessions_list = []
+    projects_agg = {}
+
+    # daily: date_str -> {input, output, cache_read, cache_create}
+    daily_agg = {}
+    # hourly: hour -> {total_output, total_turns, day_set}
+    hourly_agg = {h: {"total_output": 0, "total_turns": 0, "days": set()} for h in range(24)}
+
+    for project_dir in projects_dir.iterdir():
+        if not project_dir.is_dir():
+            continue
+        project_name = _decode_project_name(project_dir.name)
+
+        for jsonl_file in project_dir.glob("*.jsonl"):
+            session_id = jsonl_file.stem  # UUID
+            session_id_short = session_id[:8]
+
+            # Session-level accumulators
+            s_input = s_output = s_cache_read = s_cache_create = 0
+            s_turns = s_user_prompts = 0
+            s_first_ts = s_last_ts = None
+            model_counts = {}
+
+            for entry in parse_jsonl(jsonl_file):
+                entry_type = entry.get("type", "")
+                ts_str = entry.get("timestamp")
+                ts = None
+                if ts_str:
+                    try:
+                        ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                    except Exception:
+                        pass
+
+                if entry_type == "user":
+                    s_user_prompts += 1
+                    if ts:
+                        if s_first_ts is None or ts < s_first_ts:
+                            s_first_ts = ts
+                        if s_last_ts is None or ts > s_last_ts:
+                            s_last_ts = ts
+
+                elif entry_type == "assistant":
+                    msg = entry.get("message", {})
+                    model = msg.get("model", "unknown")
+                    usage = msg.get("usage", {})
+                    inp = usage.get("input_tokens", 0)
+                    out = usage.get("output_tokens", 0)
+                    cr = usage.get("cache_read_input_tokens", 0)
+                    cc = usage.get("cache_creation_input_tokens", 0)
+
+                    s_turns += 1
+                    s_input += inp
+                    s_output += out
+                    s_cache_read += cr
+                    s_cache_create += cc
+                    model_counts[model] = model_counts.get(model, 0) + 1
+
+                    if ts:
+                        if s_first_ts is None or ts < s_first_ts:
+                            s_first_ts = ts
+                        if s_last_ts is None or ts > s_last_ts:
+                            s_last_ts = ts
+
+                    # Daily / hourly — only last 60 days
+                    if ts and ts >= cutoff_60d:
+                        date_str = ts.strftime("%Y-%m-%d")
+                        if date_str not in daily_agg:
+                            daily_agg[date_str] = {"input": 0, "output": 0, "cache_read": 0, "cache_create": 0}
+                        daily_agg[date_str]["input"] += inp
+                        daily_agg[date_str]["output"] += out
+                        daily_agg[date_str]["cache_read"] += cr
+                        daily_agg[date_str]["cache_create"] += cc
+
+                        hour = ts.hour
+                        hourly_agg[hour]["total_output"] += out
+                        hourly_agg[hour]["total_turns"] += 1
+                        hourly_agg[hour]["days"].add(date_str)
+
+            if s_turns == 0 and s_user_prompts == 0:
+                continue
+
+            # Most frequent model
+            primary_model = max(model_counts, key=lambda k: model_counts[k]) if model_counts else "unknown"
+            cost = calc_cost(primary_model, s_input, s_output, s_cache_read, s_cache_create)
+
+            last_active = s_last_ts.isoformat().replace("+00:00", "Z") if s_last_ts else None
+            duration_min = 0.0
+            if s_first_ts and s_last_ts and s_last_ts > s_first_ts:
+                duration_min = round((s_last_ts - s_first_ts).total_seconds() / 60, 1)
+
+            sessions_list.append({
+                "session_id": session_id_short,
+                "project": project_name,
+                "last_active": last_active,
+                "duration_minutes": duration_min,
+                "model": primary_model,
+                "turns": s_turns,
+                "user_prompts": s_user_prompts,
+                "input_tokens": s_input,
+                "output_tokens": s_output,
+                "cache_read_tokens": s_cache_read,
+                "cache_creation_tokens": s_cache_create,
+                "cost": cost,
+                "_last_ts": s_last_ts,  # temp for sorting
+            })
+
+            # Project aggregation
+            if project_name not in projects_agg:
+                projects_agg[project_name] = {
+                    "sessions": 0, "turns": 0, "user_prompts": 0,
+                    "input_tokens": 0, "output_tokens": 0,
+                    "cache_read_tokens": 0, "cache_creation_tokens": 0,
+                    "cost": 0.0,
+                }
+            p = projects_agg[project_name]
+            p["sessions"] += 1
+            p["turns"] += s_turns
+            p["user_prompts"] += s_user_prompts
+            p["input_tokens"] += s_input
+            p["output_tokens"] += s_output
+            p["cache_read_tokens"] += s_cache_read
+            p["cache_creation_tokens"] += s_cache_create
+            p["cost"] += cost
+
+    # Sort sessions by last_active desc, take top 30
+    sessions_list.sort(key=lambda x: x["_last_ts"] or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+    sessions_list = sessions_list[:30]
+    for s in sessions_list:
+        s.pop("_last_ts", None)
+
+    # Build daily series — last 30 days, oldest first
+    daily = []
+    for i in range(29, -1, -1):
+        d = cutoff_30d + timedelta(days=i + 1)
+        date_str = d.strftime("%Y-%m-%d")
+    # Rebuild: iterate from oldest (30 days ago) to today
+    daily = []
+    start_30d = now_utc - timedelta(days=29)
+    for i in range(30):
+        d = start_30d + timedelta(days=i)
+        date_str = d.strftime("%Y-%m-%d")
+        agg = daily_agg.get(date_str, {"input": 0, "output": 0, "cache_read": 0, "cache_create": 0})
+        daily.append({
+            "date": date_str,
+            "input": agg["input"],
+            "output": agg["output"],
+            "cache_read": agg["cache_read"],
+            "cache_create": agg["cache_create"],
+        })
+
+    # Build hourly averages
+    hourly = []
+    for h in range(24):
+        agg = hourly_agg[h]
+        n_days = len(agg["days"]) or 1
+        hourly.append({
+            "hour": h,
+            "avg_output": round(agg["total_output"] / n_days),
+            "avg_turns": round(agg["total_turns"] / n_days, 1),
+        })
+
+    return {
+        "sessions": sessions_list,
+        "projects": projects_agg,
+        "daily": daily,
+        "hourly": hourly,
+    }
+
+
+def collect_codex_details():
+    from datetime import datetime, timezone, timedelta
+
+    codex_dir = Path.home() / ".codex"
+    state_db = codex_dir / "state_5.sqlite"
+    if not state_db.exists():
+        return {"sessions": [], "projects": {}, "daily": [], "hourly": []}
+
+    now_utc = datetime.now(timezone.utc)
+    cutoff_60d = now_utc - timedelta(days=60)
+    start_30d = now_utc - timedelta(days=29)
+
+    def project_from_cwd(cwd):
+        if not cwd:
+            return "unknown"
+        parts = [p for p in cwd.replace("\\", "/").split("/") if p]
+        if len(parts) >= 2:
+            return parts[-2] + "/" + parts[-1]
+        return parts[-1] if parts else "unknown"
+
+    try:
+        conn = sqlite3.connect(str(state_db))
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT id, model, tokens_used, cwd, created_at_ms, updated_at_ms
+            FROM threads
+            WHERE model IS NOT NULL AND created_at_ms IS NOT NULL
+            ORDER BY created_at_ms DESC
+        """)
+        threads = cur.fetchall()
+        conn.close()
+    except Exception:
+        return {"sessions": [], "projects": {}, "daily": [], "hourly": []}
+
+    sessions_list = []
+    projects_agg = {}
+    daily_agg = {}
+    hourly_agg = {h: {"total_output": 0, "total_turns": 0, "days": set()} for h in range(24)}
+
+    for thread_id, model, tokens_used, cwd, created_ms, updated_ms in threads:
+        project = project_from_cwd(cwd)
+        tokens = tokens_used or 0
+        input_tok = tokens // 2
+        output_tok = tokens - input_tok
+
+        created_dt = datetime.fromtimestamp(created_ms / 1000, tz=timezone.utc) if created_ms else None
+        updated_dt = datetime.fromtimestamp(updated_ms / 1000, tz=timezone.utc) if updated_ms else None
+
+        duration_min = 0.0
+        if created_ms and updated_ms and updated_ms > created_ms:
+            duration_min = round((updated_ms - created_ms) / 60000, 1)
+
+        cost = calc_cost(model or "", input_tok, output_tok, 0, 0)
+        last_active = updated_dt.isoformat().replace("+00:00", "Z") if updated_dt else None
+
+        sessions_list.append({
+            "session_id": (thread_id or "")[:8],
+            "project": project,
+            "last_active": last_active,
+            "duration_minutes": duration_min,
+            "model": model or "unknown",
+            "turns": 0,
+            "user_prompts": 0,
+            "input_tokens": input_tok,
+            "output_tokens": output_tok,
+            "cache_read_tokens": 0,
+            "cache_creation_tokens": 0,
+            "cost": cost,
+            "_created_dt": created_dt,
+        })
+
+        if project not in projects_agg:
+            projects_agg[project] = {
+                "sessions": 0, "turns": 0, "user_prompts": 0,
+                "input_tokens": 0, "output_tokens": 0,
+                "cache_read_tokens": 0, "cache_creation_tokens": 0, "cost": 0.0,
+            }
+        p = projects_agg[project]
+        p["sessions"] += 1
+        p["input_tokens"] += input_tok
+        p["output_tokens"] += output_tok
+        p["cost"] += cost
+
+        if created_dt and created_dt >= cutoff_60d:
+            date_str = created_dt.strftime("%Y-%m-%d")
+            if date_str not in daily_agg:
+                daily_agg[date_str] = {"input": 0, "output": 0, "cache_read": 0, "cache_create": 0}
+            daily_agg[date_str]["input"] += input_tok
+            daily_agg[date_str]["output"] += output_tok
+
+            hour = created_dt.hour
+            hourly_agg[hour]["total_output"] += output_tok
+            hourly_agg[hour]["total_turns"] += 1
+            hourly_agg[hour]["days"].add(date_str)
+
+    sessions_list.sort(
+        key=lambda x: x["_created_dt"] or datetime.min.replace(tzinfo=timezone.utc),
+        reverse=True,
+    )
+    sessions_list = sessions_list[:30]
+    for s in sessions_list:
+        s.pop("_created_dt", None)
+
+    daily = []
+    for i in range(30):
+        d = start_30d + timedelta(days=i)
+        date_str = d.strftime("%Y-%m-%d")
+        agg = daily_agg.get(date_str, {"input": 0, "output": 0, "cache_read": 0, "cache_create": 0})
+        daily.append({"date": date_str, **agg})
+
+    hourly = []
+    for h in range(24):
+        agg = hourly_agg[h]
+        n = len(agg["days"]) or 1
+        hourly.append({
+            "hour": h,
+            "avg_output": round(agg["total_output"] / n),
+            "avg_turns": round(agg["total_turns"] / n, 1),
+        })
+
+    return {"sessions": sessions_list, "projects": projects_agg, "daily": daily, "hourly": hourly}
+
+
+def collect_antigravity_details():
+    from datetime import datetime, timezone, timedelta
+
+    base_dir = get_antigravity_base_dir()
+    brain_dir = base_dir / "brain"
+    if not brain_dir.exists():
+        return {"sessions": [], "projects": {}, "daily": [], "hourly": []}
+
+    now_utc = datetime.now(timezone.utc)
+    cutoff_60d = now_utc - timedelta(days=60)
+    start_30d = now_utc - timedelta(days=29)
+    path_pat = re.compile(r'/(?:Users|home)/[^\s"<>\n,\\]+')
+
+    sessions_list = []
+    projects_agg = {}
+    daily_agg = {}
+    hourly_agg = {h: {"total_turns": 0, "days": set()} for h in range(24)}
+
+    for session_folder in brain_dir.iterdir():
+        if not session_folder.is_dir():
+            continue
+        transcript_path = session_folder / ".system_generated" / "logs" / "transcript.jsonl"
+        if not transcript_path.exists():
+            continue
+
+        s_first_ts = s_last_ts = None
+        s_turns = s_user_prompts = 0
+        project = "unknown"
+
+        for entry in parse_jsonl(transcript_path):
+            ts_str = entry.get("created_at")
+            ts = None
+            if ts_str:
+                try:
+                    ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                except Exception:
+                    pass
+
+            if ts:
+                if s_first_ts is None or ts < s_first_ts:
+                    s_first_ts = ts
+                if s_last_ts is None or ts > s_last_ts:
+                    s_last_ts = ts
+
+            etype = entry.get("type", "")
+
+            if project == "unknown":
+                raw = json.dumps(entry)
+                for m in path_pat.findall(raw):
+                    m = m.rstrip('",\\/')
+                    parts = [p for p in m.split("/") if p and p not in ("Users", "home")]
+                    if len(parts) >= 2 and parts[0] not in ("etc", "usr", "var", "tmp", "private", "Library"):
+                        project = parts[-2] + "/" + parts[-1]
+                        break
+
+            if etype == "USER_INPUT":
+                s_user_prompts += 1
+                s_turns += 1
+            elif etype in ("MODEL_RESPONSE", "PLANNER_RESPONSE"):
+                s_turns += 1
+
+            if ts and ts >= cutoff_60d and etype in ("USER_INPUT", "MODEL_RESPONSE"):
+                date_str = ts.strftime("%Y-%m-%d")
+                if date_str not in daily_agg:
+                    daily_agg[date_str] = {"input": 0, "output": 0, "cache_read": 0, "cache_create": 0}
+                daily_agg[date_str]["output"] += 1
+                hour = ts.hour
+                hourly_agg[hour]["total_turns"] += 1
+                hourly_agg[hour]["days"].add(date_str)
+
+        if s_last_ts is None:
+            continue
+
+        duration_min = 0.0
+        if s_first_ts and s_last_ts and s_last_ts > s_first_ts:
+            duration_min = round((s_last_ts - s_first_ts).total_seconds() / 60, 1)
+
+        sessions_list.append({
+            "session_id": session_folder.name[:8],
+            "project": project,
+            "last_active": s_last_ts.isoformat().replace("+00:00", "Z"),
+            "duration_minutes": duration_min,
+            "model": "gemini",
+            "turns": s_turns,
+            "user_prompts": s_user_prompts,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_read_tokens": 0,
+            "cache_creation_tokens": 0,
+            "cost": 0.0,
+            "_last_ts": s_last_ts,
+        })
+
+        if project not in projects_agg:
+            projects_agg[project] = {
+                "sessions": 0, "turns": 0, "user_prompts": 0,
+                "input_tokens": 0, "output_tokens": 0,
+                "cache_read_tokens": 0, "cache_creation_tokens": 0, "cost": 0.0,
+            }
+        p = projects_agg[project]
+        p["sessions"] += 1
+        p["turns"] += s_turns
+        p["user_prompts"] += s_user_prompts
+
+    sessions_list.sort(
+        key=lambda x: x["_last_ts"] or datetime.min.replace(tzinfo=timezone.utc),
+        reverse=True,
+    )
+    sessions_list = sessions_list[:30]
+    for s in sessions_list:
+        s.pop("_last_ts", None)
+
+    daily = []
+    for i in range(30):
+        d = start_30d + timedelta(days=i)
+        date_str = d.strftime("%Y-%m-%d")
+        agg = daily_agg.get(date_str, {"input": 0, "output": 0, "cache_read": 0, "cache_create": 0})
+        daily.append({"date": date_str, **agg})
+
+    hourly = []
+    for h in range(24):
+        agg = hourly_agg[h]
+        n = len(agg["days"]) or 1
+        hourly.append({"hour": h, "avg_output": 0, "avg_turns": round(agg["total_turns"] / n, 1)})
+
+    return {"sessions": sessions_list, "projects": projects_agg, "daily": daily, "hourly": hourly}
+
+
 def get_all_metrics():
     return {
         "antigravity": collect_model_metrics(),
